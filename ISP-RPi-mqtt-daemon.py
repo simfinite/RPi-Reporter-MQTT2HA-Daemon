@@ -296,6 +296,12 @@ if config.has_section('Commands'):
     if len(commandSet) > 0:
         commands.update(commandSet)
 
+systemd_services = OrderedDict([])
+if config.has_section('SystemdServices'):
+    serviceSet = dict(config['SystemdServices'].items())
+    if len(serviceSet) > 0:
+        systemd_services.update(serviceSet)
+
 # -----------------------------------------------------------------------------
 #  Commands Subscription
 # -----------------------------------------------------------------------------
@@ -432,6 +438,8 @@ rpi_cpuload1 = ''
 rpi_cpuload5 = ''
 rpi_cpuload15 = ''
 rpi_update_count = 0
+# dictionary for systemd service statuses
+rpi_systemd_services = OrderedDict([])
 
 if apt_available == False:
     rpi_update_count = -1   # if packaging system not avail. report -1
@@ -1251,6 +1259,21 @@ def getNumberOfAvailableUpdates():
         update_last_fetch_time = time()
 
 
+def getSystemdServicesStatus():
+    global rpi_systemd_services
+    statuses = OrderedDict([])
+    if len(systemd_services) > 0:
+        for service_name, friendly_name in systemd_services.items():
+            # Use 'is-active' which returns the state as a string
+            stdout, _, returncode = invoke_shell_cmd(
+                "systemctl is-active {}".format(service_name))
+            status = 'inactive' # Default to inactive
+            if not returncode:
+                status = stdout.decode('utf-8').strip()
+            statuses[service_name] = status
+    rpi_systemd_services = statuses
+    print_line('rpi_systemd_services=[{}]'.format(rpi_systemd_services), debug=True)
+
 # get our hostnames so we can setup MQTT
 getHostnames()
 sensor_name = 'rpi-{}'.format(rpi_hostname)
@@ -1487,6 +1510,21 @@ detectorValues = OrderedDict([
     ))
 ])
 
+for service_name, friendly_name in systemd_services.items():
+    clean_service_name = clean_identifier(service_name).replace('.', '_')
+    detectorValues.update({
+        'service_{}'.format(clean_service_name): dict(
+            title="Service {}".format(friendly_name),
+            topic_category='binary_sensor',
+            device_class='running',
+            no_title_prefix='yes',
+            json_value="systemd_services['{}']".format(service_name),
+            payload_on='active',
+            payload_off='inactive'
+        )
+    })
+
+
 for [command, _] in commands.items():
     # print_line('- REGISTER command: [{}]'.format(command), debug=True)
     iconName = 'mdi:gesture-tap'
@@ -1534,7 +1572,11 @@ for [sensor, params] in detectorValues.items():
         payload['unit_of_measurement'] = params['unit']
     if 'json_value' in params:
         payload['stat_t'] = values_topic_rel
-        payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
+        # Handle nested dictionary access for services
+        if "['" in params['json_value']:
+             payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
+        else:
+             payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
     if 'command' in params:
         payload['~'] = command_base_topic
         payload['cmd_t'] = '~/{}'.format(params['command'])
@@ -1544,6 +1586,10 @@ for [sensor, params] in detectorValues.items():
     payload['avty_t'] = activity_topic_rel
     payload['pl_avail'] = lwt_online_val
     payload['pl_not_avail'] = lwt_offline_val
+    if 'payload_on' in params:
+        payload['pl_on'] = params['payload_on']
+    if 'payload_off' in params:
+        payload['pl_off'] = params['payload_off']
     if 'trigger_type' in params:
         payload['type'] = params['trigger_type']
     if 'trigger_subtype' in params:
@@ -1669,6 +1715,8 @@ K_RPI_CPU_LOAD5 = "load_5min_prcnt"
 K_RPI_CPU_LOAD15 = "load_15min_prcnt"
 # list of throttle status
 K_RPI_THROTTLE = "throttle"
+# dictionary of systemd services
+K_RPI_SYSTEMD = "systemd_services"
 
 
 def send_status(timestamp, nothing):
@@ -1725,6 +1773,9 @@ def send_status(timestamp, nothing):
 
     if len(rpi_throttle_status) > 0:
         rpiData[K_RPI_THROTTLE] = rpi_throttle_status
+
+    if len(rpi_systemd_services) > 0:
+        rpiData[K_RPI_SYSTEMD] = rpi_systemd_services
 
     rpiData[K_RPI_SYSTEM_TEMP] = forceSingleDigit(rpi_system_temp)
     rpiData[K_RPI_GPU_TEMP] = forceSingleDigit(rpi_gpu_temp)
@@ -1857,6 +1908,7 @@ def update_values():
     getLastUpdateDate()
     getDeviceMemory()
     getNetworkIFs()
+    getSystemdServicesStatus()
 
 # -----------------------------------------------------------------------------
 

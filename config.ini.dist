@@ -24,6 +24,13 @@
 #reboot = /usr/bin/sudo /sbin/shutdown -r now 'reboot rqst via MQTT'
 #restart_service = /usr/bin/sudo systemctl restart isp-rpi-reporter.service
 
+[SystemdServices]
+# List of systemd services to monitor.
+# The key is the service name (e.g. mosquitto.service)
+# The value is the friendly name to be used in Home Assistant
+#mosquitto.service = Mosquitto Broker
+#ssh.service = SSH Server
+
 [MQTT]
 
 # The hostname or IP address of the MQTT broker to connect to (Default: localhost)
