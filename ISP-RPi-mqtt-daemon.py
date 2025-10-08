@@ -1264,16 +1264,35 @@ def getSystemdServicesStatus():
     statuses = OrderedDict([])
     if len(systemd_services) > 0:
         for service_name, friendly_name in systemd_services.items():
-            # Use 'is-active' which returns the state as a string
+            # Use 'status' to get detailed information, including the 'since' value
             stdout, _, returncode = invoke_shell_cmd(
-                "systemctl is-active {}".format(service_name))
-            status = 'inactive' # Default to inactive
-            if not returncode:
-                status = stdout.decode('utf-8').strip()
-            statuses[service_name] = status
+                "systemctl status {}".format(service_name))
+            
+            service_info = {'status': 'unknown', 'since': 'N/A'}
+            output = stdout.decode('utf-8')
+            
+            # Find the main status (active, inactive, failed, etc.)
+            status_match = re.search(r'Active:\s+(\w+)', output)
+            if status_match:
+                status = status_match.group(1)
+                service_info['status'] = status
+
+                # For inactive (oneshot) services, check the exit code
+                if status == 'inactive':
+                    exit_match = re.search(r'status=(\d+)/(\w+)', output)
+                    if exit_match:
+                        exit_code = int(exit_match.group(1))
+                        # Override status with a more descriptive one for HA
+                        service_info['status'] = 'success' if exit_code == 0 else 'failure'
+
+            # Find the duration part of the status line (e.g., "2 days ago")
+            since_match = re.search(r'(?:since|ago).*;\s*(.*)', output)
+            if since_match:
+                service_info['since'] = since_match.group(1).strip().replace(' ago', '')
+
+            statuses[service_name] = service_info
     rpi_systemd_services = statuses
     print_line('rpi_systemd_services=[{}]'.format(rpi_systemd_services), debug=True)
-
 # get our hostnames so we can setup MQTT
 getHostnames()
 sensor_name = 'rpi-{}'.format(rpi_hostname)
@@ -1518,9 +1537,10 @@ for service_name, friendly_name in systemd_services.items():
             topic_category='binary_sensor',
             device_class='running',
             no_title_prefix='yes',
-            json_value="systemd_services['{}']".format(service_name),
-            payload_on='active',
-            payload_off='inactive'
+            json_value="systemd_services['{}']['status']".format(service_name),
+            payload_on='active,success',
+            payload_off='inactive,failure',
+            json_attr_value="systemd_services['{}']['since']".format(service_name)
         )
     })
 
@@ -1572,11 +1592,10 @@ for [sensor, params] in detectorValues.items():
         payload['unit_of_measurement'] = params['unit']
     if 'json_value' in params:
         payload['stat_t'] = values_topic_rel
-        # Handle nested dictionary access for services
-        if "['" in params['json_value']:
-             payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
-        else:
-             payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
+        payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
+    if 'json_attr_value' in params:
+        payload['json_attr_t'] = values_topic_rel
+        payload['json_attr_tpl'] = "{{{{ {{'since': value_json.{}.{}}} | tojson }}}}".format(K_LD_PAYLOAD_NAME, params['json_attr_value'])
     if 'command' in params:
         payload['~'] = command_base_topic
         payload['cmd_t'] = '~/{}'.format(params['command'])
@@ -1586,8 +1605,10 @@ for [sensor, params] in detectorValues.items():
     payload['avty_t'] = activity_topic_rel
     payload['pl_avail'] = lwt_online_val
     payload['pl_not_avail'] = lwt_offline_val
-    if 'payload_on' in params:
-        payload['pl_on'] = params['payload_on']
+    if 'payload_on' in params: # Can be a comma-separated list
+        payload['pl_on'] = params['payload_on'].split(',')[0] # Use first as primary
+        if len(params['payload_on'].split(',')) > 1:
+             payload['val_tpl'] = "{{% if value_json.{0}.{1} in ('{2}') %}}on{{% else %}}off{{% endif %}}".format(K_LD_PAYLOAD_NAME, params['json_value'], "','".join(params['payload_on'].split(',')))
     if 'payload_off' in params:
         payload['pl_off'] = params['payload_off']
     if 'trigger_type' in params:
