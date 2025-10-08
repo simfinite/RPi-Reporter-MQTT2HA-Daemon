@@ -1590,12 +1590,13 @@ for [sensor, params] in detectorValues.items():
         payload['dev_cla'] = params['device_class']
     if 'unit' in params:
         payload['unit_of_measurement'] = params['unit']
+    
+    # Default state topic and value template
     if 'json_value' in params:
         payload['stat_t'] = values_topic_rel
         payload['val_tpl'] = "{{{{ value_json.{}.{} }}}}".format(K_LD_PAYLOAD_NAME, params['json_value'])
-    if 'json_attr_value' in params:
-        payload['json_attr_t'] = values_topic_rel
-        payload['json_attr_tpl'] = "{{{{ {{'since': value_json.{}.{}}} | tojson }}}}".format(K_LD_PAYLOAD_NAME, params['json_attr_value'])
+
+    # Command topics for buttons
     if 'command' in params:
         payload['~'] = command_base_topic
         payload['cmd_t'] = '~/{}'.format(params['command'])
@@ -1605,12 +1606,21 @@ for [sensor, params] in detectorValues.items():
     payload['avty_t'] = activity_topic_rel
     payload['pl_avail'] = lwt_online_val
     payload['pl_not_avail'] = lwt_offline_val
+
+    # Handle binary sensors with multiple 'on' states (like our services)
     if 'payload_on' in params: # Can be a comma-separated list
-        payload['pl_on'] = params['payload_on'].split(',')[0] # Use first as primary
-        if len(params['payload_on'].split(',')) > 1:
-             payload['val_tpl'] = "{{% if value_json.{0}.{1} in ('{2}') %}}on{{% else %}}off{{% endif %}}".format(K_LD_PAYLOAD_NAME, params['json_value'], "','".join(params['payload_on'].split(',')))
+        on_states = params['payload_on'].split(',')
+        payload['pl_on'] = on_states[0] # Use first as primary for simple cases
+        # If there are multiple 'on' states, create a more complex value template
+        if len(on_states) > 1:
+             payload['val_tpl'] = "{{% if value_json.{0}.{1} in {2} %}}on{{% else %}}off{{% endif %}}".format(K_LD_PAYLOAD_NAME, params['json_value'], on_states)
     if 'payload_off' in params:
         payload['pl_off'] = params['payload_off']
+
+    # JSON Attributes for sensors
+    if 'json_attr_value' in params:
+        payload['json_attr_t'] = values_topic_rel
+        payload['json_attr_tpl'] = "{{{{ {{'since': value_json.{}.{}}} | tojson }}}}".format(K_LD_PAYLOAD_NAME, params['json_attr_value'])
     if 'trigger_type' in params:
         payload['type'] = params['trigger_type']
     if 'trigger_subtype' in params:
