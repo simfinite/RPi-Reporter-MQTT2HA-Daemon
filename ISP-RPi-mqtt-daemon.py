@@ -1449,10 +1449,10 @@ getHostnames()
 sensor_name = 'rpi-{}'.format(rpi_hostname)
 
 # Resolve the HA device name now that the hostname is known. HA prefixes every
-# entity on the device with this, so the default is the short hostname rather than
-# the FQDN ("pi4-one", not "RPi-pi4-one.simfinite.de").
+# entity on the device with this, so the default is the bare hostname ("pi4-one")
+# — anything longer makes every entity name longer for no benefit.
 if not device_name:
-    device_name = 'RPi-{}'.format(rpi_hostname)
+    device_name = rpi_hostname
 
 # get model so we can use it too in MQTT
 getDeviceModel()
@@ -1571,10 +1571,15 @@ mqtt_password = os.environ.get(
 
 if mqtt_username:
     mqtt_client.username_pw_set(mqtt_username, mqtt_password)
+
+# Resolved once so the stale-topic scan can reuse them.
+mqtt_host = os.environ.get(
+    'MQTT_HOSTNAME', config['MQTT'].get('hostname', 'localhost'))
+mqtt_port = int(os.environ.get(
+    'MQTT_PORT', config['MQTT'].get('port', '1883')))
+
 try:
-    mqtt_client.connect(os.environ.get('MQTT_HOSTNAME', config['MQTT'].get('hostname', 'localhost')),
-                        port=int(os.environ.get(
-                            'MQTT_PORT', config['MQTT'].get('port', '1883'))),
+    mqtt_client.connect(mqtt_host, port=mqtt_port,
                         keepalive=config['MQTT'].getint('keepalive', 60))
 except:
     print_line('MQTT connection error. Please check your settings in the configuration file "config.ini"',
@@ -1637,6 +1642,10 @@ else:
     cpu_use_icon = "mdi:cpu-64-bit"
 
 print_line('Announcing RPi Monitoring device to MQTT broker for auto-discovery ...')
+
+# Every discovery topic we publish in this run. Anything else found retained under
+# our subtree afterwards is stale and gets deleted (see remove_stale_discovery_topics).
+published_discovery_topics = set()
 
 # Publish our MQTT auto discovery
 #  table of key items to publish:
@@ -1852,8 +1861,63 @@ for [sensor, params] in detectorValues.items():
             'identifiers': ["{}".format(uniqID)],
         }
     mqtt_client.publish(discovery_topic, json.dumps(payload), 1, retain=True)
+    published_discovery_topics.add(discovery_topic)
 
     # remove connections as test:                  'connections' : [["mac", mac.lower()], [interface, ipaddr]],
+
+# -----------------------------------------------------------------------------
+#  Remove stale discovery topics
+# -----------------------------------------------------------------------------
+#
+# Discovery payloads are published with retain=True, so an entity that is no longer
+# announced stays in Home Assistant forever (it shows as unavailable, or worse, as a
+# duplicate). That happens whenever a unit is renamed, a pod is collapsed, or a
+# service is removed.
+#
+# Fix: subscribe to our own discovery subtree, collect every retained topic, and
+# publish an empty retained payload to any topic we did NOT just announce. HA treats
+# an empty retained payload as "delete this entity".
+#
+# Only topics under OUR sensor_name are touched, so other integrations are safe.
+
+def remove_stale_discovery_topics():
+    stale = []
+
+    def collect(client, userdata, message):
+        if message.retain and message.topic not in published_discovery_topics:
+            stale.append(message.topic)
+
+    try:
+        collector = mqtt.Client(
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    except AttributeError:
+        collector = mqtt.Client()
+    collector.on_message = collect
+    if mqtt_username:
+        collector.username_pw_set(mqtt_username, mqtt_password)
+    try:
+        collector.connect(mqtt_host, port=mqtt_port, keepalive=60)
+        collector.subscribe('{}/+/{}'.format(discovery_prefix, sensor_name.lower()))
+        collector.loop_start()
+        sleep(3.0)   # let the broker deliver every retained message
+        collector.loop_stop()
+        collector.disconnect()
+    except Exception as e:
+        print_line('* Could not scan for stale discovery topics: {}'.format(e),
+                   warning=True)
+        return
+
+    if not stale:
+        print_line('No stale discovery topics found.', verbose=True)
+        return
+
+    for topic in stale:
+        mqtt_client.publish(topic, payload='', retain=True)
+        print_line('Removed stale discovery topic: {}'.format(topic), verbose=True)
+    print_line('Removed {} stale discovery topic(s).'.format(len(stale)))
+
+
+remove_stale_discovery_topics()
 
 # -----------------------------------------------------------------------------
 #  timer and timer funcs for period handling

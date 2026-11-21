@@ -9,8 +9,8 @@
 
 # Device name shown in Home Assistant. HA prefixes EVERY entity on the device with
 # it (has_entity_name=true for MQTT discovery), so keep it short.
-# Default: "RPi-<hostname>"
-#device_name = RPi-pi4-one
+# Default: the bare hostname (e.g. "pi4-one")
+#device_name = pi4-one
 
 # Enable or Disable an endless execution loop (Default: true)
 #enabled = true
