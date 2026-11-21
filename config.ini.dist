@@ -26,10 +26,23 @@
 
 [SystemdServices]
 # List of systemd services to monitor.
-# The key is the service name (e.g. mosquitto.service)
+# The key is the unit name (e.g. mosquitto.service)
 # The value is the friendly name to be used in Home Assistant
+#
+# Units in the ADMIN USER's systemd manager (rootless podman quadlets) must be
+# prefixed with `user:`. The daemon has to run as that user to read its manager.
+#
+# Each unit produces two HA entities:
+#   binary_sensor.<name>          - on when active/success, off otherwise
+#   sensor.<name>_last_run        - timestamp of the last state change / last run
+#
+# Oneshot units (backups, timers) report success/failure from their LAST run, so
+# they read "on" after a successful run even though they are inactive between runs.
 #mosquitto.service = Mosquitto Broker
 #ssh.service = SSH Server
+#borgmatic.service = Borgmatic backups
+#sync-borg-offsite.service = Offsite sync
+#user:prometheus.service = Prometheus
 
 [MQTT]
 

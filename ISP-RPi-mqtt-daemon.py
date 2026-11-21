@@ -296,11 +296,24 @@ if config.has_section('Commands'):
     if len(commandSet) > 0:
         commands.update(commandSet)
 
+# [SystemdServices] maps a unit name to a friendly name:
+#   borgmatic.service = Borgmatic backups
+# Units that live in the ADMIN USER's systemd manager (rootless quadlets) are
+# marked with a `user:` prefix on the key:
+#   user:prometheus.service = Prometheus
+# The daemon must run as that user to read its manager (see getSystemdServicesStatus).
 systemd_services = OrderedDict([])
 if config.has_section('SystemdServices'):
-    serviceSet = dict(config['SystemdServices'].items())
-    if len(serviceSet) > 0:
-        systemd_services.update(serviceSet)
+    for raw_key, friendly_name in config['SystemdServices'].items():
+        key = raw_key.strip()
+        scope = 'system'
+        if key.startswith('user:'):
+            scope = 'user'
+            key = key[len('user:'):].strip()
+        systemd_services[key] = {
+            'name': friendly_name.strip(),
+            'scope': scope,
+        }
 
 # -----------------------------------------------------------------------------
 #  Commands Subscription
@@ -1259,38 +1272,137 @@ def getNumberOfAvailableUpdates():
         update_last_fetch_time = time()
 
 
+def dict_to_jinja(mapping):
+    '''
+    Render {key: "value_json.info.a.b"} as a Jinja dict literal:
+        {'key': value_json.info.a.b, ...}
+
+    Used to build a json_attr_tpl that HA evaluates against the state payload.
+    Values are inserted verbatim (they are Jinja expressions, not strings).
+    '''
+    return '{%s}' % ', '.join(
+        "'{}': {}".format(k, v) for k, v in mapping.items())
+
+
+def parse_systemctl_show(output):
+    '''
+    Parse `systemctl show` output into {unit_name: {property: value}}.
+
+    `systemctl show` emits blank-line-separated blocks of `Key=Value` lines, one
+    block per unit. This is machine-readable and locale-independent — unlike
+    `systemctl status`, whose human-formatted text would need fragile regexes and
+    breaks under a non-English locale.
+    '''
+    units = OrderedDict([])
+    current = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            current = None
+            continue
+        if '=' not in line:
+            continue
+        key, _, value = line.partition('=')
+        if key == 'Id':
+            current = value
+            units[current] = {}
+        if current is not None:
+            units[current][key] = value
+    return units
+
+
 def getSystemdServicesStatus():
+    '''
+    Collect state for every configured systemd unit.
+
+    Two batched calls (system manager + the admin user's manager) instead of one
+    `systemctl status` per unit: fewer processes, and the user manager is where the
+    ROOTLESS quadlets live (prometheus, immich, paperless, plex, ...). The daemon
+    must therefore run as the admin user, not as `daemon` — a system service cannot
+    reach another user's systemd manager.
+
+    Reported per unit:
+      status   - 'active' | 'success' | 'failure' | 'inactive' | 'unknown'
+                 (oneshot units report success/failure from their last run)
+      state    - raw ActiveState (active/inactive/failed/...)
+      type     - systemd Type (oneshot vs forking/simple/notify)
+      since    - ISO timestamp of the last state change (or last run for oneshots)
+      result   - systemd Result property (success/exit-code/timeout/...)
+      exit     - ExecMainStatus (the process exit code)
+    '''
     global rpi_systemd_services
     statuses = OrderedDict([])
-    if len(systemd_services) > 0:
-        for service_name, friendly_name in systemd_services.items():
-            # Use 'status' to get detailed information, including the 'since' value
-            stdout, _, returncode = invoke_shell_cmd(
-                "systemctl status {}".format(service_name))
-            
-            service_info = {'status': 'unknown', 'since': 'N/A'}
-            output = stdout.decode('utf-8')
-            
-            # Find the main status (active, inactive, failed, etc.)
-            status_match = re.search(r'Active:\s+(\w+)', output)
-            if status_match:
-                status = status_match.group(1)
-                service_info['status'] = status
+    if len(systemd_services) == 0:
+        rpi_systemd_services = statuses
+        return
 
-                # For inactive (oneshot) services, check the exit code
-                if status == 'inactive':
-                    exit_match = re.search(r'status=(\d+)/(\w+)', output)
-                    if exit_match:
-                        exit_code = int(exit_match.group(1))
-                        # Override status with a more descriptive one for HA
-                        service_info['status'] = 'success' if exit_code == 0 else 'failure'
+    # Split the configured units by which systemd manager owns them.
+    system_units = []
+    user_units = []
+    for service_name, spec in systemd_services.items():
+        scope = spec.get('scope', 'system') if isinstance(spec, dict) else 'system'
+        (user_units if scope == 'user' else system_units).append(service_name)
 
-            # Find the duration part of the status line (e.g., "2 days ago")
-            since_match = re.search(r'(?:since|ago).*;\s*(.*)', output)
-            if since_match:
-                service_info['since'] = since_match.group(1).strip().replace(' ago', '')
+    props = ('-p Id -p ActiveState -p SubState -p Type -p Result '
+             '-p ExecMainStatus -p ExecMainExitTimestamp -p ActiveEnterTimestamp '
+             '-p InactiveEnterTimestamp')
 
-            statuses[service_name] = service_info
+    collected = OrderedDict([])
+    if system_units:
+        stdout, _, _ = invoke_shell_cmd(
+            'systemctl show {} {}'.format(props, ' '.join(system_units)))
+        collected.update(parse_systemctl_show(stdout.decode('utf-8')))
+    if user_units:
+        # The user manager needs XDG_RUNTIME_DIR. The daemon runs AS that user, but
+        # a system service does not inherit it, so set it explicitly from our uid.
+        runtime_dir = os.environ.get(
+            'XDG_RUNTIME_DIR', '/run/user/{}'.format(os.getuid()))
+        stdout, _, _ = invoke_shell_cmd(
+            'XDG_RUNTIME_DIR={} systemctl --user show {} {}'.format(
+                runtime_dir, props, ' '.join(user_units)))
+        collected.update(parse_systemctl_show(stdout.decode('utf-8')))
+
+    for service_name, spec in systemd_services.items():
+        friendly_name = spec.get('name', service_name) if isinstance(spec, dict) else spec
+        info = collected.get(service_name, {})
+
+        active_state = info.get('ActiveState', 'unknown')
+        result = info.get('Result', '')
+        exit_status = info.get('ExecMainStatus', '')
+        unit_type = info.get('Type', '')
+
+        # A oneshot unit is 'inactive (dead)' between runs; its last run's outcome
+        # lives in Result/ExecMainStatus. Report that instead of a bare 'inactive',
+        # which would look like a stopped service.
+        if unit_type == 'oneshot' and active_state == 'inactive':
+            if result == 'success' and exit_status in ('0', ''):
+                status = 'success'
+            elif result:
+                status = 'failure'
+            else:
+                status = 'inactive'   # never run yet
+        elif active_state == 'failed':
+            status = 'failure'
+        else:
+            status = active_state
+
+        # Prefer the exit timestamp for oneshots (that IS "last run"), otherwise the
+        # time the unit entered its current state.
+        since = (info.get('ExecMainExitTimestamp')
+                 or info.get('ActiveEnterTimestamp')
+                 or info.get('InactiveEnterTimestamp')
+                 or '')
+
+        statuses[service_name] = {
+            'name': friendly_name,
+            'status': status,
+            'state': active_state,
+            'type': unit_type,
+            'since': since,
+            'result': result,
+            'exit': exit_status,
+        }
+
     rpi_systemd_services = statuses
     print_line('rpi_systemd_services=[{}]'.format(rpi_systemd_services), debug=True)
 # get our hostnames so we can setup MQTT
@@ -1529,8 +1641,14 @@ detectorValues = OrderedDict([
     ))
 ])
 
-for service_name, friendly_name in systemd_services.items():
+for service_name, spec in systemd_services.items():
+    friendly_name = spec['name']
     clean_service_name = clean_identifier(service_name).replace('.', '_')
+    # A binary_sensor answers "is it running right now?". That is the right shape
+    # for long-running units, but a ONESHOT unit (borgmatic, the offsite sync) is
+    # 'inactive (dead)' almost always — a binary sensor would sit at 'off' and say
+    # nothing useful. For those we ALSO publish a timestamp sensor carrying the last
+    # run time, so HA can alert on "no successful backup in N hours".
     detectorValues.update({
         'service_{}'.format(clean_service_name): dict(
             title="Service {}".format(friendly_name),
@@ -1538,9 +1656,30 @@ for service_name, friendly_name in systemd_services.items():
             device_class='running',
             no_title_prefix='yes',
             json_value="systemd_services['{}']['status']".format(service_name),
+            # These are the STATUS VALUES that count as "on" (the template below
+            # maps them to the ON/OFF literals HA compares against pl_on/pl_off).
+            # The previous version emitted 'on'/'off' from the template while pl_on
+            # was 'active', so the sensor always read off.
             payload_on='active,success',
             payload_off='inactive,failure',
-            json_attr_value="systemd_services['{}']['since']".format(service_name)
+            json_attr_value="systemd_services['{}']['since']".format(service_name),
+            json_attr_extra={
+                'state': "systemd_services['{}']['state']".format(service_name),
+                'result': "systemd_services['{}']['result']".format(service_name),
+                'exit': "systemd_services['{}']['exit']".format(service_name),
+                'type': "systemd_services['{}']['type']".format(service_name),
+            },
+        )
+    })
+    # Timestamp sensor: last state change (for oneshots: last run). HA renders this
+    # as "x minutes ago" and can trigger on staleness.
+    detectorValues.update({
+        'service_{}_last_run'.format(clean_service_name): dict(
+            title="Service {} last run".format(friendly_name),
+            topic_category='sensor',
+            device_class='timestamp',
+            no_title_prefix='yes',
+            json_value="systemd_services['{}']['since']".format(service_name),
         )
     })
 
@@ -1607,20 +1746,32 @@ for [sensor, params] in detectorValues.items():
     payload['pl_avail'] = lwt_online_val
     payload['pl_not_avail'] = lwt_offline_val
 
-    # Handle binary sensors with multiple 'on' states (like our services)
-    if 'payload_on' in params: # Can be a comma-separated list
+    # Binary sensors whose state is derived from a multi-valued field (our services
+    # report active/success/failure/inactive). The template must emit exactly the
+    # literals in pl_on/pl_off, otherwise HA compares 'on' against 'active' and the
+    # sensor never turns on.
+    if 'payload_on' in params:
         on_states = params['payload_on'].split(',')
-        payload['pl_on'] = on_states[0] # Use first as primary for simple cases
-        # If there are multiple 'on' states, create a more complex value template
-        if len(on_states) > 1:
-             payload['val_tpl'] = "{{% if value_json.{0}.{1} in {2} %}}on{{% else %}}off{{% endif %}}".format(K_LD_PAYLOAD_NAME, params['json_value'], on_states)
-    if 'payload_off' in params:
-        payload['pl_off'] = params['payload_off']
+        # The template emits the ON/OFF literals, so pl_on/pl_off must be exactly
+        # those. (A comma-separated pl_off is treated by HA as ONE literal, so the
+        # sensor would never turn off.)
+        payload['pl_on'] = 'ON'
+        payload['pl_off'] = 'OFF'
+        payload['val_tpl'] = (
+            "{{% if value_json.{0}.{1} in {2} %}}ON{{% else %}}OFF{{% endif %}}"
+        ).format(K_LD_PAYLOAD_NAME, params['json_value'], on_states)
 
-    # JSON Attributes for sensors
+    # JSON Attributes for sensors. `json_attr_value` is the primary attribute;
+    # `json_attr_extra` adds more (state/result/exit/type for services).
     if 'json_attr_value' in params:
         payload['json_attr_t'] = values_topic_rel
-        payload['json_attr_tpl'] = "{{{{ {{'since': value_json.{}.{}}} | tojson }}}}".format(K_LD_PAYLOAD_NAME, params['json_attr_value'])
+        attr_map = {'since': "value_json.{}.{}".format(
+            K_LD_PAYLOAD_NAME, params['json_attr_value'])}
+        for attr_name, attr_path in params.get('json_attr_extra', {}).items():
+            attr_map[attr_name] = "value_json.{}.{}".format(
+                K_LD_PAYLOAD_NAME, attr_path)
+        payload['json_attr_tpl'] = "{{{{ {} | tojson }}}}".format(
+            dict_to_jinja(attr_map))
     if 'trigger_type' in params:
         payload['type'] = params['trigger_type']
     if 'trigger_subtype' in params:
