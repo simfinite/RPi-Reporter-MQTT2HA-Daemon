@@ -1897,7 +1897,11 @@ def remove_stale_discovery_topics():
         collector.username_pw_set(mqtt_username, mqtt_password)
     try:
         collector.connect(mqtt_host, port=mqtt_port, keepalive=60)
-        collector.subscribe('{}/+/{}'.format(discovery_prefix, sensor_name.lower()))
+        # Topics are <prefix>/<category>/<sensor_name>/<sensor>/config — FIVE levels.
+        # Subscribing to fewer levels matches nothing (verified: a 3-level pattern
+        # returned 0 retained messages while the topics clearly existed).
+        collector.subscribe('{}/+/{}/+/config'.format(
+            discovery_prefix, sensor_name.lower()))
         collector.loop_start()
         sleep(3.0)   # let the broker deliver every retained message
         collector.loop_stop()
