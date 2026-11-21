@@ -4,7 +4,7 @@ from urllib3.exceptions import InsecureRequestWarning
 import requests
 import time
 import _thread
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from tzlocal import get_localzone
 import threading
 import socket
@@ -1284,6 +1284,37 @@ def dict_to_jinja(mapping):
         "'{}': {}".format(k, v) for k, v in mapping.items())
 
 
+def systemd_timestamp_to_iso(value):
+    '''
+    Convert a systemd timestamp to ISO 8601, which is what Home Assistant's
+    `timestamp` device class requires.
+
+    systemd emits e.g. "Sat 2026-11-21 02:04:30 UTC" (and "" when unset). HA cannot
+    parse that, so a timestamp sensor fed the raw string renders as `undefined`.
+    Returns '' for an empty/unparseable value so the sensor shows "unknown" rather
+    than a bogus date.
+    '''
+    if not value:
+        return ''
+    # Drop the weekday prefix ("Sat ") — strptime's %a is locale-dependent.
+    parts = value.strip().split(None, 1)
+    if len(parts) == 2 and len(parts[0]) == 3:
+        value = parts[1]
+    value = value.strip()
+
+    # ⚠️ %Z parses "UTC" but yields a NAIVE datetime, so .astimezone() would assume
+    # LOCAL time and shift the value by the UTC offset. Attach UTC explicitly.
+    for fmt in ('%Y-%m-%d %H:%M:%S %Z', '%Y-%m-%d %H:%M:%S'):
+        try:
+            parsed = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.isoformat()
+    return ''
+
+
 def parse_systemctl_show(output):
     '''
     Parse `systemctl show` output into {unit_name: {property: value}}.
@@ -1387,11 +1418,13 @@ def getSystemdServicesStatus():
             status = active_state
 
         # Prefer the exit timestamp for oneshots (that IS "last run"), otherwise the
-        # time the unit entered its current state.
-        since = (info.get('ExecMainExitTimestamp')
-                 or info.get('ActiveEnterTimestamp')
-                 or info.get('InactiveEnterTimestamp')
-                 or '')
+        # time the unit entered its current state. Converted to ISO 8601 because the
+        # HA timestamp sensor cannot parse systemd's "Sat 2026-11-21 02:04:30 UTC".
+        since = systemd_timestamp_to_iso(
+            info.get('ExecMainExitTimestamp')
+            or info.get('ActiveEnterTimestamp')
+            or info.get('InactiveEnterTimestamp')
+            or '')
 
         statuses[service_name] = {
             'name': friendly_name,
