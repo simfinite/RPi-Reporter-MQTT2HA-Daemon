@@ -1674,6 +1674,12 @@ detectorValues = OrderedDict([
     ))
 ])
 
+# Collect the unit types BEFORE building the discovery payload: the timestamp
+# sensor's name depends on whether the unit is a oneshot ("last run") or a
+# long-running service ("uptime"). Without this the type is unknown here and every
+# sensor would be labelled "last run".
+getSystemdServicesStatus()
+
 for service_name, spec in systemd_services.items():
     friendly_name = spec['name']
     clean_service_name = clean_identifier(service_name).replace('.', '_')
@@ -1704,11 +1710,15 @@ for service_name, spec in systemd_services.items():
             },
         )
     })
-    # Timestamp sensor: last state change (for oneshots: last run). HA renders this
-    # as "x minutes ago" and can trigger on staleness.
+    # Timestamp sensor. The meaning of the timestamp depends on the unit type:
+    #   oneshot      -> when the last run FINISHED  -> "last run"
+    #   long-running -> when the unit STARTED       -> "uptime"
+    # Labelling a container's start time "last run" is misleading.
+    is_oneshot = (rpi_systemd_services.get(service_name, {}).get('type') == 'oneshot')
     detectorValues.update({
         'service_{}_last_run'.format(clean_service_name): dict(
-            title="Service {} last run".format(friendly_name),
+            title="Service {} {}".format(
+                friendly_name, 'last run' if is_oneshot else 'uptime'),
             topic_category='sensor',
             device_class='timestamp',
             no_title_prefix='yes',
