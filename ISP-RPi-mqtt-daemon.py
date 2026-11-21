@@ -290,6 +290,12 @@ default_domain = ''
 fallback_domain = config['Daemon'].get(
     'fallback_domain', default_domain).lower()
 
+# Device name shown in Home Assistant. HA prefixes EVERY entity on the device with
+# it (has_entity_name=true for MQTT discovery), so keep it short — the default
+# "RPi-<fqdn>" produced names like "RPi-pi4-one Service Prometheus".
+# Empty means "derive from the hostname" (resolved after getHostnames() runs).
+device_name = config['Daemon'].get('device_name', '')
+
 commands = OrderedDict([])
 if config.has_section('Commands'):
     commandSet = dict(config['Commands'].items())
@@ -1442,6 +1448,12 @@ def getSystemdServicesStatus():
 getHostnames()
 sensor_name = 'rpi-{}'.format(rpi_hostname)
 
+# Resolve the HA device name now that the hostname is known. HA prefixes every
+# entity on the device with this, so the default is the short hostname rather than
+# the FQDN ("pi4-one", not "RPi-pi4-one.simfinite.de").
+if not device_name:
+    device_name = 'RPi-{}'.format(rpi_hostname)
+
 # get model so we can use it too in MQTT
 getDeviceModel()
 getDeviceCpuInfo()
@@ -1633,7 +1645,10 @@ detectorValues = OrderedDict([
         title="Monitor",
         topic_category="sensor",
         device_class="timestamp",
-        device_ident="RPi-{}".format(rpi_fqdn),
+        # Device name shown in HA. Every entity on this device is prefixed with it
+        # (HA sets has_entity_name=true for MQTT discovery), so a long value makes
+        # every entity name long. Overridable via [Daemon] device_name.
+        device_ident=device_name,
         no_title_prefix="yes",
         icon='mdi:raspberry-pi',
         json_attr="yes",
